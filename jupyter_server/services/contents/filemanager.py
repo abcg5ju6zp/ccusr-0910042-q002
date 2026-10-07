@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import math
 import mimetypes
 import os
@@ -15,6 +16,7 @@ import stat
 import subprocess
 import sys
 import typing as t
+import uuid
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -513,6 +515,437 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
             with self.perm_to_403():
                 rm(os_path)
 
+    # ------------------------------------------------------------------
+    # Recoverable delete transaction
+    # ------------------------------------------------------------------
+    #
+    # A delete spans two stores: the content itself and its checkpoints.
+    # Removing them independently leaves an unrecoverable window in which the
+    # content is gone but an old checkpoint is still visible (or vice versa).
+    # The transaction moves both stores into a per-attempt staging directory
+    # next to the content first; the move can be undone. Only when every
+    # participant is staged do we commit (delete the staged copies), and the
+    # delete event is emitted by the caller after that succeeds.
+    #
+    # A small JSON state file next to the content records the staged paths, so
+    # a process that dies (or a request whose connection drops) between stages
+    # is resumed on the next call instead of leaving the user guessing whether
+    # cleanup should continue or the content be restored.
+
+    _delete_transactions_supported = True
+
+    _DELETE_STATE_SUFFIX = ".jupyter-delete-state"
+    _DELETE_STAGING_PREFIX = ".jupyter-delete-staging-"
+
+    def _delete_state_path(self, os_path):
+        """Sibling state file tracking an in-flight delete of ``os_path``."""
+        parent, name = os.path.split(os_path)
+        return os.path.join(parent, "." + name + self._DELETE_STATE_SUFFIX)
+
+    def _delete_staging_path(self, os_path):
+        """Fresh per-attempt staging directory next to the content."""
+        parent, name = os.path.split(os_path)
+        return os.path.join(parent, f"{self._DELETE_STAGING_PREFIX}{name}-{uuid.uuid4().hex[:8]}")
+
+    def _validate_delete_target(self, path, os_path):
+        """Pre-delete checks shared with the legacy single-shot delete.
+
+        Uses direct filesystem checks (rather than ``self.exists``/``is_hidden``
+        which are coroutines on async managers) so the transaction primitives
+        stay synchronous and can run in a worker thread for either manager.
+        """
+        if not self.allow_hidden and is_hidden(os_path, self.root_dir):
+            raise web.HTTPError(400, f"Cannot delete file or directory {os_path!r}")
+
+        if not os.path.lexists(os_path):
+            raise web.HTTPError(404, "file or directory does not exist: %r" % path)
+
+        def is_non_empty_dir():
+            if os.path.isdir(os_path):
+                # A directory containing only leftover checkpoints is
+                # considered empty.
+                cp_dir = getattr(self.checkpoints, "checkpoint_dir", None)
+                if set(os.listdir(os_path)) - {cp_dir}:
+                    return True
+            return False
+
+        if self.delete_to_trash:
+            if not self.always_delete_dir and sys.platform == "win32" and is_non_empty_dir():
+                # send2trash can really delete files on Windows, so disallow
+                # deleting non-empty directories. See Github issue 3631.
+                raise web.HTTPError(400, "Directory %s not empty" % os_path)
+            if not self.is_writable(path):
+                raise web.HTTPError(403, "Permission denied: %s" % path) from None
+        elif os.path.isdir(os_path):
+            if not self.always_delete_dir and is_non_empty_dir():
+                raise web.HTTPError(400, "Directory %s not empty" % os_path)
+
+    def _write_delete_state(self, token):
+        """Persist the transaction token atomically."""
+        state_path = token["state_path"]
+        tmp_path = state_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(token, f)
+        os.replace(tmp_path, state_path)
+
+    def _write_staging_sidecar(self, token):
+        """Record cp_moves inside the staging directory.
+
+        Unlike the sibling state file (which may never be written if the
+        process dies mid-staging), the sidecar travels with the staging
+        directory and lets orphaned staging be committed on recovery.
+        """
+        sidecar = os.path.join(token["staging"], "transaction.json")
+        tmp_path = sidecar + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({"cp_moves": token.get("cp_moves", [])}, f)
+        os.replace(tmp_path, sidecar)
+
+    def _remove_delete_state(self, token):
+        try:
+            os.unlink(token["state_path"])
+        except FileNotFoundError:
+            pass
+
+    def _recover_pending_delete(self, path):
+        """Resume a delete whose state a previous attempt left behind."""
+        os_path = self._get_os_path(path)
+        state_path = self._delete_state_path(os_path)
+        if os.path.isfile(state_path):
+            try:
+                with open(state_path, encoding="utf-8") as f:
+                    token = json.load(f)
+            except (OSError, ValueError) as e:
+                raise web.HTTPError(
+                    500,
+                    f"Unrecoverable interrupted deletion of {path!r}: "
+                    f"state file {state_path} is unreadable ({e})",
+                ) from e
+            self.log.info("Resuming interrupted deletion of %r from %s", path, state_path)
+            if os.path.lexists(os_path):
+                # The content was recreated after the interruption. The state
+                # file belongs to the abandoned delete: drop its staged copies
+                # without touching the new content or its checkpoints, then let
+                # the current request run normally.
+                self.checkpoints.discard_staged_checkpoints(
+                    token.get("cp_moves", []), remove_originals=False
+                )
+                self._remove_path(token.get("content"), is_dir=token.get("is_dir", False))
+                self._remove_delete_state(token)
+                shutil.rmtree(token.get("staging", ""), ignore_errors=True)
+                return False
+            self._commit_delete_transaction(token)
+            return True
+        return self._recover_orphan_staging(path)
+
+    def _recover_orphan_staging(self, path):
+        """Commit a staging directory left without a state file.
+
+        Covers the narrow window in which the process died after the content
+        and checkpoints were staged but before the state file was written.
+        The staged layout is regular enough to reconstruct the token: the
+        content copy keeps its name under ``content/`` and staged checkpoint
+        files are prefixed with their iteration index.
+        """
+        os_path = self._get_os_path(path)
+        parent, name = os.path.split(os_path)
+        prefix = f"{self._DELETE_STAGING_PREFIX}{name}-"
+        if not os.path.isdir(parent):
+            return False
+
+        candidates = sorted(
+            entry.path
+            for entry in os.scandir(parent)
+            if entry.is_dir() and entry.name.startswith(prefix)
+        )
+        if not candidates:
+            return False
+
+        # If live content exists again at the target path the staging belongs
+        # to an abandoned transaction (content was recreated after a crash);
+        # discard only the stale staged copies and let the current request
+        # proceed, so recreated content and its checkpoints are never touched.
+        if os.path.lexists(os_path):
+            for staging in candidates:
+                shutil.rmtree(staging, ignore_errors=True)
+            return False
+
+        recovered = False
+        for staging in candidates:
+            content = os.path.join(staging, "content")
+            if not os.path.lexists(content):
+                continue
+            cp_moves = self._reconstruct_staged_checkpoint_moves(path, staging)
+            token = {
+                "path": path,
+                "os_path": os_path,
+                "is_dir": os.path.isdir(content),
+                "mode": "permanent",
+                "staging": staging,
+                "content": content,
+                "cp_moves": cp_moves,
+                "state_path": self._delete_state_path(os_path),
+            }
+            self.log.info("Recovering orphaned staged deletion of %r from %s", path, staging)
+            self._commit_delete_transaction(token)
+            recovered = True
+        return recovered
+
+    def _reconstruct_staged_checkpoint_moves(self, path, staging):
+        """Rebuild ``(original, staged)`` checkpoint pairs from a staging dir."""
+        sidecar = os.path.join(staging, "transaction.json")
+        if os.path.isfile(sidecar):
+            try:
+                with open(sidecar, encoding="utf-8") as f:
+                    return json.load(f).get("cp_moves", [])
+            except (OSError, ValueError):
+                self.log.warning(
+                    "Unreadable delete transaction sidecar %s; "
+                    "falling back to checkpoint path heuristics.",
+                    sidecar,
+                )
+
+        # Heuristic fallback: primary checkpoint location only. Temp-tree
+        # checkpoints cannot be reconstructed without the sidecar; they are
+        # orphaned and logged rather than silently dropped.
+        staged_root = os.path.join(staging, "checkpoints")
+        if not os.path.isdir(staged_root):
+            return []
+        cp_dir = os.path.dirname(self.checkpoints._primary_checkpoint_path(path))  # type: ignore[attr-defined]
+        moves: list[tuple[str, str]] = []
+        for entry in sorted(os.scandir(staged_root), key=lambda e: e.name):
+            if not entry.is_file():
+                continue
+            head, sep, original_name = entry.name.partition("-")
+            if not sep or not head.isdigit():
+                continue
+            moves.append((os.path.join(cp_dir, original_name), entry.path))
+        return moves
+
+    def _begin_delete_transaction(self, path):
+        """Stage content and checkpoints without destroying either."""
+        path = path.strip("/")
+        os_path = self._get_os_path(path)
+        self._validate_delete_target(path, os_path)
+
+        is_dir = os.path.isdir(os_path)
+        staging = self._delete_staging_path(os_path)
+        token = {
+            "path": path,
+            "os_path": os_path,
+            "is_dir": is_dir,
+            "mode": "trash" if self.delete_to_trash else "permanent",
+            "staging": staging,
+            "content": os.path.join(staging, "content"),
+            "cp_moves": [],
+            "state_path": self._delete_state_path(os_path),
+        }
+
+        try:
+            with self.perm_to_403():
+                os.makedirs(staging)
+        except OSError as e:
+            raise web.HTTPError(500, f"Cannot prepare deletion of {path}: {e}") from e
+
+        # Stage 1: move checkpoint records aside. This happens *before* the
+        # content is touched, so a checkpoint store error never occurs with the
+        # content already missing.
+        extra = self.checkpoints.fallback_checkpoint_files(path) if is_dir else None
+        try:
+            token["cp_moves"] = self.checkpoints.stage_purge_checkpoints(path, staging, extra)
+        except web.HTTPError:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        except OSError as e:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise web.HTTPError(500, f"Cannot stage checkpoints for deletion of {path}: {e}") from e
+        # Sidecar lets an orphaned staging directory (state file never written)
+        # be recovered even when checkpoint originals lived in the temp tree.
+        try:
+            self._write_staging_sidecar(token)
+        except OSError as e:
+            # The content has not been touched yet; move the checkpoints back.
+            self.checkpoints.restore_staged_checkpoints(token["cp_moves"])
+            shutil.rmtree(staging, ignore_errors=True)
+            raise web.HTTPError(500, f"Cannot record deletion state for {path}: {e}") from e
+
+        # Stage 2: remove the content from view, keeping a local copy for
+        # rollback.
+        try:
+            if token["mode"] == "trash":
+                if is_dir:
+                    shutil.copytree(os_path, token["content"])
+                else:
+                    shutil.copy2(os_path, token["content"])
+                try:
+                    send2trash(os_path)
+                except OSError as e:
+                    self._abort_delete_transaction(token)
+                    raise web.HTTPError(400, "send2trash failed: %s" % e) from e
+            elif is_dir:
+                shutil.move(os_path, token["content"])
+            else:
+                os.rename(os_path, token["content"])
+        except web.HTTPError:
+            raise
+        except Exception as e:
+            self._abort_delete_transaction(token)
+            raise web.HTTPError(500, f"Failed to stage deletion of {path}: {e}") from e
+
+        # Stage 3: record what is staged. From this point on a crash or a
+        # failed commit is resumed instead of rolled back.
+        try:
+            self._write_delete_state(token)
+        except OSError as e:
+            # The state cannot be recorded, so a retry would not find the
+            # staged content; undo the staging instead when possible.
+            self._abort_delete_transaction(token)
+            raise web.HTTPError(500, f"Cannot record deletion state for {path}: {e}") from e
+        return token
+
+    def _abort_delete_transaction(self, token):
+        """Roll back a staged delete before its state has been committed.
+
+        Both stores are restored together. If the content cannot be put back,
+        checkpoints are deliberately left staged and the transaction state is
+        persisted: the only remaining convergent outcome is finishing the
+        delete on retry. If checkpoints cannot be put back, the content is
+        re-staged for the same reason.
+        """
+        os_path = token["os_path"]
+        staged_content = token["content"]
+
+        content_visible = os.path.exists(os_path)
+        if not content_visible and os.path.exists(staged_content):
+            try:
+                shutil.move(staged_content, os_path)
+                content_visible = True
+            except OSError:
+                self.log.error(
+                    "Failed to restore content %s while aborting delete; "
+                    "a retry will finish the cleanup.",
+                    os_path,
+                    exc_info=True,
+                )
+
+        if not content_visible:
+            # Keep checkpoints staged; retry commits the whole delete.
+            self._safe_write_delete_state(token)
+            return
+
+        try:
+            self.checkpoints.restore_staged_checkpoints(token.get("cp_moves", []))
+        except Exception:
+            self.log.error(
+                "Failed to restore checkpoints while aborting delete of %s; "
+                "re-staging content so a retry finishes the cleanup.",
+                token.get("path"),
+                exc_info=True,
+            )
+            try:
+                if os.path.exists(os_path) and not os.path.exists(staged_content):
+                    shutil.move(os_path, staged_content)
+            except OSError:
+                pass
+            self._safe_write_delete_state(token)
+            return
+
+        self._remove_delete_state(token)
+        shutil.rmtree(token["staging"], ignore_errors=True)
+
+    @staticmethod
+    def _remove_path(path, *, is_dir):
+        """Remove a staged file or directory, tolerating an already-gone path."""
+        if not os.path.lexists(path):
+            return
+        if is_dir:
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+
+    def _safe_write_delete_state(self, token):
+        """Best-effort persistence used by compensation paths."""
+        try:
+            self._write_delete_state(token)
+        except OSError:
+            self.log.error(
+                "Could not persist interrupted-delete state for %r; "
+                "staged copies are left on disk for manual recovery.",
+                token.get("path"),
+                exc_info=True,
+            )
+
+    def _commit_delete_transaction(self, token):
+        """Destroy staged checkpoints and content; clear transaction state."""
+        # Discard checkpoints first. If that fails, roll the visible content
+        # back and surface the error: nothing has been irreversibly removed.
+        try:
+            self.checkpoints.discard_staged_checkpoints(token.get("cp_moves", []))
+        except Exception:
+            self.log.error(
+                "Checkpoint cleanup failed while deleting %r; restoring content.",
+                token.get("path"),
+                exc_info=True,
+            )
+            self._rollback_committed_content(token)
+            raise
+
+        # Checkpoints are gone for good and the content already left the
+        # visible namespace; remaining errors are cleanup that a retry resumes.
+        try:
+            self._remove_path(token["content"], is_dir=token.get("is_dir", False))
+        except OSError as e:
+            self._safe_write_delete_state(token)
+            raise web.HTTPError(
+                500,
+                f"Content of {token.get('path')!r} is deleted but its staged "
+                f"copy could not be removed; a retry will finish the cleanup: {e}",
+            ) from e
+
+        self._remove_delete_state(token)
+        shutil.rmtree(token["staging"], ignore_errors=True)
+
+    def _rollback_committed_content(self, token):
+        """Restore content and checkpoints after checkpoint discard failed.
+
+        If either half of the compensation fails, everything that could be
+        restored is re-staged and the transaction state is kept so a retry
+        converges to a completed delete instead of exposing mixed state.
+        """
+        os_path = token["os_path"]
+        staged_content = token["content"]
+        try:
+            if not os.path.exists(os_path) and os.path.exists(staged_content):
+                shutil.move(staged_content, os_path)
+        except OSError:
+            self.log.error(
+                "Could not restore content %s after checkpoint cleanup failed; "
+                "a retry will finish the deletion.",
+                os_path,
+                exc_info=True,
+            )
+            self._safe_write_delete_state(token)
+            return
+
+        try:
+            self.checkpoints.restore_staged_checkpoints(token.get("cp_moves", []))
+        except Exception:
+            self.log.error(
+                "Could not restore checkpoints of %s after a failed commit; "
+                "re-staging content so a retry finishes the deletion.",
+                token.get("path"),
+                exc_info=True,
+            )
+            try:
+                if os.path.exists(os_path) and not os.path.exists(staged_content):
+                    shutil.move(os_path, staged_content)
+            except OSError:
+                pass
+            self._safe_write_delete_state(token)
+            return
+        self._remove_delete_state(token)
+        shutil.rmtree(token["staging"], ignore_errors=True)
+
     def rename_file(self, old_path, new_path):
         """项目内部接口说明。"""
         old_path = old_path.strip("/")
@@ -927,6 +1360,21 @@ class AsyncFileContentsManager(  # type: ignore[misc]
             self.log.debug("Unlinking file %s", os_path)
             with self.perm_to_403():
                 await run_sync(rm, os_path)
+
+    # The delete transaction primitives are synchronous filesystem work
+    # (including send2trash, which blocks); run them in a worker thread so the
+    # event loop is not stalled while staging and committing the transaction.
+    async def _arecover_pending_delete(self, path):
+        """项目内部接口说明。"""
+        return await run_sync(self._recover_pending_delete, path)
+
+    async def _abegin_delete_transaction(self, path):
+        """项目内部接口说明。"""
+        return await run_sync(self._begin_delete_transaction, path)
+
+    async def _acommit_delete_transaction(self, token):
+        """项目内部接口说明。"""
+        await run_sync(self._commit_delete_transaction, token)
 
     async def rename_file(self, old_path, new_path):
         """项目内部接口说明。"""

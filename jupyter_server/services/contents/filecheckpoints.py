@@ -1,5 +1,7 @@
 """项目内部接口说明。"""
 
+from __future__ import annotations
+
 import os
 import shutil
 import tempfile
@@ -22,6 +24,8 @@ from .fileio import AsyncFileManagerMixin, FileManagerMixin
 
 class FileCheckpoints(FileManagerMixin, Checkpoints):
     """项目内部接口说明。"""
+
+    supports_staged_purge = True
 
     checkpoint_dir = Unicode(
         ".ipynb_checkpoints",
@@ -91,7 +95,113 @@ class FileCheckpoints(FileManagerMixin, Checkpoints):
         else:
             return [self.checkpoint_model(checkpoint_id, os_path)]
 
+    # Recoverable checkpoint purge used while deleting content. The contents
+    # manager owns the transaction directory (same filesystem as the content
+    # whenever possible); these helpers only move checkpoint files in and out
+    # of it, so an aborted delete can restore every checkpoint record. The
+    # helpers are plain filesystem operations and never call the (possibly
+    # async) checkpoint API, so the async manager can run them in a thread.
+    def stage_purge_checkpoints(self, path, staging_dir, extra_paths=None):
+        """Move checkpoint files of ``path`` under ``staging_dir``.
+
+        ``extra_paths`` lets the caller add checkpoint files stored outside
+        the regular sibling location (e.g. records kept in the temp fallback
+        tree for contents of a deleted directory).
+
+        Returns a list of ``(original_path, staged_path)`` pairs.
+        """
+        path = path.strip("/")
+        cp_root = os.path.join(staging_dir, "checkpoints")
+        candidates = [self._primary_checkpoint_path(path)]
+        if extra_paths:
+            candidates.extend(extra_paths)
+
+        moves: list[tuple[str, str]] = []
+        for index, src in enumerate(dict.fromkeys(candidates)):
+            if not os.path.isfile(src):
+                continue
+            dest = os.path.join(cp_root, f"{index}-{os.path.basename(src)}")
+            ensure_dir_exists(os.path.dirname(dest))
+            try:
+                with self.perm_to_403():
+                    shutil.move(src, dest)
+            except Exception:
+                # Undo the moves already made so a failed staging leaves the
+                # checkpoint store in its original state.
+                self.restore_staged_checkpoints(moves)
+                raise
+            moves.append((src, dest))
+        return moves
+
+    def restore_staged_checkpoints(self, moves: list[tuple[str, str]]) -> None:
+        """Move previously staged checkpoint files back to their origin."""
+        errors: list[OSError] = []
+        for original, staged in reversed(moves):
+            if not os.path.isfile(staged):
+                errors.append(FileNotFoundError(staged))
+                continue
+            try:
+                ensure_dir_exists(os.path.dirname(original))
+                shutil.move(staged, original)
+            except OSError as e:
+                errors.append(e)
+                self.log.error("Failed to restore checkpoint %s from %s: %s", original, staged, e)
+        if errors:
+            raise errors[0]
+
+    def fallback_checkpoint_files(self, path):
+        """Checkpoint files stored in the temp fallback tree for ``path``.
+
+        When a directory is deleted, checkpoints for files nested inside it may
+        live under the system temp directory because their original folders
+        were read-only. The fallback tree is owned by the checkpoint store, so
+        every file mirrored below ``path`` is a checkpoint record.
+        """
+        path = path.strip("/")
+        mirror = os.path.join(tempfile.gettempdir(), "jupyter_checkpoints", path)
+        if not path or not os.path.isdir(mirror):
+            return []
+        result: list[str] = []
+        for root, _dirs, files in os.walk(mirror):
+            result.extend(os.path.join(root, name) for name in files)
+        return result
+
+    def discard_staged_checkpoints(self, moves, *, remove_originals=True):
+        """Permanently unlink staged checkpoint files.
+
+        By default both the staged copy and (if present) a copy that a
+        previous compensation moved back to the original location are removed,
+        which makes committing an interrupted transaction idempotent. When the
+        content at the original path was recreated after a crash,
+        ``remove_originals=False`` limits cleanup to the staged copies so the
+        new content's checkpoints are left untouched. Missing files are
+        tolerated; filesystem errors propagate so the caller can retry.
+        """
+        targets = [staged for _original, staged in moves]
+        if remove_originals:
+            targets += [original for original, _staged in moves]
+        for target in targets:
+            if os.path.isfile(target):
+                with self.perm_to_403():
+                    os.unlink(target)
+
     # Checkpoint-related utilities
+    def _primary_checkpoint_path(self, path):
+        """Path of the canonical checkpoint record without creating dirs."""
+        path = path.strip("/")
+        parent, name = ("/" + path).rsplit("/", 1)
+        parent = parent.strip("/")
+        basename, ext = os.path.splitext(name)
+        filename = f"{basename}-checkpoint{ext}"
+        os_path = self._get_os_path(path=parent)
+        cp_dir = os.path.join(os_path, self.checkpoint_dir)
+        # Mirror the fallback used by checkpoint_path(): read-only parents
+        # keep checkpoints under the system temp directory.
+        if not os.access(os.path.dirname(cp_dir), os.W_OK):
+            rel = os.path.relpath(os_path, start=self.root_dir)
+            cp_dir = os.path.join(tempfile.gettempdir(), "jupyter_checkpoints", rel)
+        return os.path.join(cp_dir, filename)
+
     def checkpoint_path(self, checkpoint_id, path):
         """项目内部接口说明。"""
         path = path.strip("/")

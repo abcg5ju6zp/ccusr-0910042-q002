@@ -4,10 +4,12 @@
 # Distributed under the terms of the Modified BSD License.
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import os
 import re
+import threading
 import typing as t
 import warnings
 from fnmatch import fnmatch
@@ -390,13 +392,124 @@ class ContentsManager(LoggingConfigurable):
     # ContentsManager API part 2: methods that have usable default
     # implementations, but can be overridden in subclasses.
 
+    # Backends which can stage content/checkpoint deletion through a
+    # recoverable transaction (see FileContentsManager) flip this to True and
+    # implement the ``_*_delete_transaction`` hooks.
+    _delete_transactions_supported = False
+
+    def _delete_transaction_enabled(self):
+        """Whether this manager/checkpoint pair deletes transactionally."""
+        return self._delete_transactions_supported and getattr(
+            self.checkpoints, "supports_staged_purge", False
+        )
+
+    def _delete_lock(self, path):
+        """Serialise concurrent delete requests for the same content."""
+        guard = getattr(self, "_delete_locks_guard", None)
+        if guard is None:
+            guard = self._delete_locks_guard = threading.Lock()
+            self._delete_locks: dict[str, threading.Lock] = {}
+        with guard:
+            lock = self._delete_locks.get(path)
+            if lock is None:
+                lock = self._delete_locks[path] = threading.Lock()
+            return lock
+
     def delete(self, path):
-        """项目内部接口说明。"""
+        """Delete content and its checkpoints as one recoverable operation.
+
+        The delete event is only emitted once both the content and every
+        checkpoint record are confirmed gone. If anything fails midway the
+        state stays recoverable: either the content is restored (rollback) or
+        the interrupted operation is resumed on the next call, so a retried
+        request never has to guess whether cleanup should continue.
+        """
         path = path.strip("/")
         if not path:
             raise HTTPError(400, "Can't delete root")
+        with self._delete_lock(path):
+            if self._delete_transaction_enabled():
+                self._delete_with_transaction(path)
+            else:
+                self._delete_sequential(path)
+
+    def _delete_with_transaction(self, path):
+        """Synchronous orchestration for transaction-capable backends."""
+        # Finish a transaction interrupted by an earlier failed request.
+        if self._recover_pending_delete(path):
+            self.emit(data={"action": "delete", "path": path})
+            return
+
+        if not self.exists(path):
+            if self.checkpoints.has_pending_checkpoints(path):
+                # Content was removed by an earlier attempt while checkpoints
+                # remained (or deleted out of band). Resume cleanup instead of
+                # leaving orphaned, still-visible checkpoints behind.
+                self.checkpoints.purge_checkpoints(path)
+                self.emit(data={"action": "delete", "path": path})
+                return
+            raise HTTPError(404, "file or directory does not exist: %r" % path)
+
+        token = self._begin_delete_transaction(path)
+        if token is None:
+            # Content vanished between the check and staging; settle any
+            # checkpoint residue and report the converged result.
+            if self.checkpoints.has_pending_checkpoints(path):
+                self.checkpoints.purge_checkpoints(path)
+                self.emit(data={"action": "delete", "path": path})
+                return
+            raise HTTPError(404, "file or directory does not exist: %r" % path)
+        try:
+            self._commit_delete_transaction(token)
+        except HTTPError:
+            raise
+        except Exception as e:
+            raise HTTPError(500, f"Failed to finalize deletion of {path}: {e}") from e
+        self.emit(data={"action": "delete", "path": path})
+
+    def _recover_pending_delete(self, path):
+        """Resume an interrupted delete transaction.
+
+        Returns True if a pending transaction was found and fully committed.
+        Raises if cleanup still could not be completed (state remains
+        recoverable for another retry).
+        """
+        return False
+
+    def _begin_delete_transaction(self, path):
+        """Stage content and checkpoints without destroying either."""
+        raise NotImplementedError
+
+    def _commit_delete_transaction(self, token):
+        """Destroy the staged content and checkpoints."""
+        raise NotImplementedError
+
+    def _delete_sequential(self, path):
+        """Fallback ordering for backends without delete transactions.
+
+        Content is removed first and checkpoints are purged with an idempotent
+        operation afterwards. If the purge fails the request fails but a
+        retry finds the content gone and resumes the checkpoint cleanup, so
+        the two stores still converge and no delete event is emitted
+        meanwhile.
+        """
+        if not self.exists(path):
+            if self.checkpoints.has_pending_checkpoints(path):
+                self.checkpoints.purge_checkpoints(path)
+                self.emit(data={"action": "delete", "path": path})
+                return
+            raise HTTPError(404, "file or directory does not exist: %r" % path)
         self.delete_file(path)
-        self.checkpoints.delete_all_checkpoints(path)
+        try:
+            self.checkpoints.purge_checkpoints(path)
+        except HTTPError:
+            self.log.error(
+                "Content %r was deleted but checkpoint cleanup failed; "
+                "retrying the request will finish the cleanup.",
+                path,
+                exc_info=True,
+            )
+            raise
         self.emit(data={"action": "delete", "path": path})
 
     def rename(self, old_path, new_path):
@@ -677,14 +790,99 @@ class AsyncContentsManager(ContentsManager):
         """项目内部接口说明。"""
         return None
 
+    async def _adelete_lock(self, path):
+        """Serialise concurrent async delete requests for the same content."""
+        guard = getattr(self, "_adelete_locks_guard", None)
+        if guard is None:
+            guard = self._adelete_locks_guard = asyncio.Lock()
+            self._adelete_locks: dict[str, asyncio.Lock] = {}
+        async with guard:
+            lock = self._adelete_locks.get(path)
+            if lock is None:
+                lock = self._adelete_locks[path] = asyncio.Lock()
+            return lock
+
     async def delete(self, path):
-        """项目内部接口说明。"""
+        """Async counterpart of :meth:`ContentsManager.delete`.
+
+        Same recoverability guarantees: content, checkpoints and the delete
+        event converge to one consistent fact when intermediate steps fail.
+        """
         path = path.strip("/")
         if not path:
             raise HTTPError(400, "Can't delete root")
+        async with await self._adelete_lock(path):
+            if self._delete_transaction_enabled():
+                await self._adelete_with_transaction(path)
+            else:
+                await self._adelete_sequential(path)
 
+    async def _arecover_pending_delete(self, path):
+        """Async hook for resuming an interrupted delete transaction."""
+        raise NotImplementedError
+
+    async def _abegin_delete_transaction(self, path):
+        """Async hook for staging a delete transaction."""
+        raise NotImplementedError
+
+    async def _acommit_delete_transaction(self, token):
+        """Async hook for committing a staged delete transaction."""
+        raise NotImplementedError
+
+    async def _adelete_with_transaction(self, path):
+        """Asynchronous orchestration for transaction-capable backends."""
+        if await self._arecover_pending_delete(path):
+            self.emit(data={"action": "delete", "path": path})
+            return
+
+        if not await ensure_async(self.exists(path)):
+            if await self.checkpoints.has_pending_checkpoints(path):
+                # Content was removed by an earlier attempt while checkpoints
+                # remained; resume cleanup rather than leaving them visible.
+                await self.checkpoints.purge_checkpoints(path)
+                self.emit(data={"action": "delete", "path": path})
+                return
+            raise HTTPError(404, "file or directory does not exist: %r" % path)
+
+        token = await self._abegin_delete_transaction(path)
+        if token is None:
+            if await self.checkpoints.has_pending_checkpoints(path):
+                await self.checkpoints.purge_checkpoints(path)
+                self.emit(data={"action": "delete", "path": path})
+                return
+            raise HTTPError(404, "file or directory does not exist: %r" % path)
+        try:
+            await self._acommit_delete_transaction(token)
+        except HTTPError:
+            raise
+        except Exception as e:
+            raise HTTPError(500, f"Failed to finalize deletion of {path}: {e}") from e
+        self.emit(data={"action": "delete", "path": path})
+
+    async def _adelete_sequential(self, path):
+        """Async fallback ordering for backends without transactions.
+
+        Mirrors the synchronous fallback: checkpoints are purged idempotently
+        after the content removal, and a failed purge is resumed by a retry
+        which finds the content already gone.
+        """
+        if not await ensure_async(self.exists(path)):
+            if await self.checkpoints.has_pending_checkpoints(path):
+                await self.checkpoints.purge_checkpoints(path)
+                self.emit(data={"action": "delete", "path": path})
+                return
+            raise HTTPError(404, "file or directory does not exist: %r" % path)
         await self.delete_file(path)
-        await self.checkpoints.delete_all_checkpoints(path)
+        try:
+            await self.checkpoints.purge_checkpoints(path)
+        except HTTPError:
+            self.log.error(
+                "Content %r was deleted but checkpoint cleanup failed; "
+                "retrying the request will finish the cleanup.",
+                path,
+                exc_info=True,
+            )
+            raise
         self.emit(data={"action": "delete", "path": path})
 
     async def rename(self, old_path, new_path):
