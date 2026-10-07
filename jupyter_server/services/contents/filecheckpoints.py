@@ -3,6 +3,7 @@
 import os
 import shutil
 import tempfile
+from functools import partial
 
 from anyio.to_thread import run_sync
 from jupyter_core.utils import ensure_dir_exists
@@ -22,6 +23,8 @@ from .fileio import AsyncFileManagerMixin, FileManagerMixin
 
 class FileCheckpoints(FileManagerMixin, Checkpoints):
     """项目内部接口说明。"""
+
+    supports_delete_transactions = True
 
     checkpoint_dir = Unicode(
         ".ipynb_checkpoints",
@@ -90,6 +93,80 @@ class FileCheckpoints(FileManagerMixin, Checkpoints):
             return []
         else:
             return [self.checkpoint_model(checkpoint_id, os_path)]
+
+    # ------------------------------------------------------------------
+    # Transactional checkpoint deletion primitives
+    # ------------------------------------------------------------------
+
+    def _checkpoint_files_for_dir(self, os_path):
+        """Yield checkpoint artifacts for a directory stored *outside* the tree.
+
+        Checkpoints kept in ``.ipynb_checkpoints`` directories inside the
+        content directory travel with the directory itself when it is sent
+        to trash or permanently removed, so they do not need separate
+        staging.  The only out-of-tree artifacts are the fallback copies
+        stored under the OS temp directory when the content directory was
+        not writable.
+        """
+        rel = os.path.relpath(os_path, start=self.root_dir)
+        temp_root = os.path.join(tempfile.gettempdir(), "jupyter_checkpoints", rel)
+        if os.path.isdir(temp_root):
+            for root, _dirs, names in os.walk(temp_root):
+                for name in names:
+                    cp_path = os.path.join(root, name)
+                    yield os.path.relpath(cp_path, start=temp_root), cp_path
+
+    def list_checkpoint_files(self, path):
+        """项目内部接口说明。"""
+        path = path.strip("/")
+        files = []
+        os_path = self._get_os_path(path=path)
+        if os.path.isdir(os_path):
+            files.extend(self._checkpoint_files_for_dir(os_path))
+        else:
+            files.extend(self._checkpoint_files_for_file(path))
+        return files
+
+    def _checkpoint_files_for_file(self, path):
+        """Checkpoint candidates for a file, without creating any directory."""
+        path = path.strip("/")
+        parent_api, name = ("/" + path).rsplit("/", 1)
+        parent_api = parent_api.strip("/")
+        basename, ext = os.path.splitext(name)
+        filename = f"{basename}-checkpoint{ext}"
+
+        parent_os = self._get_os_path(path=parent_api)
+        candidates = [os.path.join(parent_os, self.checkpoint_dir, filename)]
+        rel = os.path.relpath(parent_os, start=self.root_dir)
+        if rel != os.pardir:
+            candidates.append(
+                os.path.join(tempfile.gettempdir(), "jupyter_checkpoints", rel, filename)
+            )
+        return [("checkpoint", cp) for cp in candidates if os.path.lexists(cp)]
+
+    def trash_checkpoint_file(self, checkpoint_path, dest_path):
+        """项目内部接口说明。"""
+        if not os.path.lexists(checkpoint_path):
+            return False
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        if os.path.lexists(dest_path):
+            # Leftover from an earlier crashed delete; the content-addressed
+            # staging path is ours, so it is safe to replace.
+            os.unlink(dest_path)
+        with self.perm_to_403():
+            shutil.move(checkpoint_path, dest_path)
+        return True
+
+    def restore_checkpoint_file(self, staged_path, checkpoint_path):
+        """项目内部接口说明。"""
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        with self.perm_to_403():
+            shutil.move(staged_path, checkpoint_path)
+
+    def purge_checkpoint_file(self, staged_path):
+        """项目内部接口说明。"""
+        with self.perm_to_403():
+            os.unlink(staged_path)
 
     # Checkpoint-related utilities
     def checkpoint_path(self, checkpoint_id, path):
@@ -184,6 +261,57 @@ class AsyncFileCheckpoints(FileCheckpoints, AsyncFileManagerMixin, AsyncCheckpoi
             return []
         else:
             return [await self.checkpoint_model(checkpoint_id, os_path)]
+
+    # ------------------------------------------------------------------
+    # Transactional checkpoint deletion primitives (async)
+    # ------------------------------------------------------------------
+
+    async def list_checkpoint_files(self, path):
+        """项目内部接口说明。"""
+        path = path.strip("/")
+        files = []
+        os_path = self._get_os_path(path=path)
+        if os.path.isdir(os_path):
+            for token, cp_path in self._checkpoint_files_for_dir(os_path):
+                files.append((token, cp_path))
+        else:
+            parent_api, name = ("/" + path).rsplit("/", 1)
+            parent_api = parent_api.strip("/")
+            basename, ext = os.path.splitext(name)
+            filename = f"{basename}-checkpoint{ext}"
+            parent_os = self._get_os_path(path=parent_api)
+            candidates = [os.path.join(parent_os, self.checkpoint_dir, filename)]
+            rel = os.path.relpath(parent_os, start=self.root_dir)
+            if rel != os.pardir:
+                candidates.append(
+                    os.path.join(tempfile.gettempdir(), "jupyter_checkpoints", rel, filename)
+                )
+            for cp in candidates:
+                if await run_sync(os.path.lexists, cp):
+                    files.append(("checkpoint", cp))
+        return files
+
+    async def trash_checkpoint_file(self, checkpoint_path, dest_path):
+        """项目内部接口说明。"""
+        if not await run_sync(os.path.lexists, checkpoint_path):
+            return False
+        await run_sync(partial(os.makedirs, exist_ok=True), os.path.dirname(dest_path))
+        if await run_sync(os.path.lexists, dest_path):
+            await run_sync(os.unlink, dest_path)
+        with self.perm_to_403():
+            await run_sync(shutil.move, checkpoint_path, dest_path)
+        return True
+
+    async def restore_checkpoint_file(self, staged_path, checkpoint_path):
+        """项目内部接口说明。"""
+        await run_sync(partial(os.makedirs, exist_ok=True), os.path.dirname(checkpoint_path))
+        with self.perm_to_403():
+            await run_sync(shutil.move, staged_path, checkpoint_path)
+
+    async def purge_checkpoint_file(self, staged_path):
+        """项目内部接口说明。"""
+        with self.perm_to_403():
+            await run_sync(os.unlink, staged_path)
 
 
 class GenericFileCheckpoints(GenericCheckpointsMixin, FileCheckpoints):

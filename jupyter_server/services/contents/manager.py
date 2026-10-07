@@ -4,12 +4,15 @@
 # Distributed under the terms of the Modified BSD License.
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import os
 import re
+import threading
 import typing as t
 import warnings
+from contextlib import contextmanager
 from fnmatch import fnmatch
 
 from jupyter_core.utils import ensure_async, run_sync
@@ -390,19 +393,340 @@ class ContentsManager(LoggingConfigurable):
     # ContentsManager API part 2: methods that have usable default
     # implementations, but can be overridden in subclasses.
 
+    # ------------------------------------------------------------------
+    # Delete serialization / recovery state
+    #
+    # ``delete`` touches two independent resources (content and
+    # checkpoints).  Per-path locks serialize duplicate requests inside
+    # this process; a file-based claim serializes other processes sharing
+    # the root dir.  Whether a request had to wait for another delete
+    # (``in_flight`` / claim contention) is what distinguishes a genuine
+    # duplicate -- answered idempotently -- from a plain request to delete
+    # something already missing -- answered with 404, as before.
+    # ------------------------------------------------------------------
+
+    def _delete_state(self):
+        """Lazily initialize per-manager delete bookkeeping."""
+        state = getattr(self, "_delete_bookkeeping", None)
+        if state is None:
+            state = {
+                "locks": {},
+                "locks_guard": threading.Lock(),
+                "in_flight": set(),
+            }
+            self._delete_bookkeeping = state
+        return state
+
+    def _path_delete_lock(self, path):
+        state = self._delete_state()
+        with state["locks_guard"]:
+            lock = state["locks"].get(path)
+            if lock is None:
+                lock = threading.Lock()
+                state["locks"][path] = lock
+            return lock
+
+    def _delete_was_active(self, path):
+        """Whether a delete for *path* was running when this request arrived."""
+        state = self._delete_state()
+        with state["locks_guard"]:
+            return path in state["in_flight"]
+
+    def _mark_delete_active(self, path, active):
+        state = self._delete_state()
+        with state["locks_guard"]:
+            if active:
+                state["in_flight"].add(path)
+            else:
+                state["in_flight"].discard(path)
+
+    @contextmanager
+    def _path_delete_claim(self, path):
+        """Cross-process claim for deleting *path*.
+
+        Yields ``contended`` via the returned context's result: True when
+        another process held the claim and this request had to wait.  A
+        claim held longer than the staleness threshold is treated as
+        orphaned (its holder crashed) and stolen.
+        """
+        claim, contended = self._acquire_delete_claim(path)
+        try:
+            yield contended
+        finally:
+            self._release_delete_claim(claim)
+
+    def _claim_path(self, path):
+        import hashlib
+        import tempfile
+
+        claims_dir = os.path.join(
+            tempfile.gettempdir(), "jupyter_pending_checkpoint_deletes", "claims"
+        )
+        os.makedirs(claims_dir, exist_ok=True)
+        root = getattr(self, "root_dir", os.getcwd())
+        token = hashlib.sha1(
+            os.path.abspath(root).encode() + b"\0" + path.encode("utf-8")
+        ).hexdigest()
+        return os.path.join(claims_dir, token)
+
+    def _acquire_delete_claim(self, path):
+        """Create (or wait for / steal) the cross-process claim for *path*.
+
+        Returns ``(claim_path, contended)``.
+        """
+        import time
+
+        claim = self._claim_path(path)
+        fd = None
+        contended = False
+        for _ in range(80):  # up to ~8 seconds
+            try:
+                fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                break
+            except FileExistsError:
+                contended = True
+                try:
+                    if time.time() - os.stat(claim).st_mtime > 30.0:
+                        # Held longer than any delete should take: the
+                        # holder probably crashed; steal the claim.
+                        os.unlink(claim)
+                        continue
+                except FileNotFoundError:
+                    pass
+                time.sleep(0.1)
+        if fd is None:
+            raise HTTPError(409, "A delete for %r is already in progress" % path)
+        try:
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+        finally:
+            os.close(fd)
+        # Refresh mtime so a live holder is never considered stale.
+        os.utime(claim, None)
+        return claim, contended
+
+    def _release_delete_claim(self, claim):
+        try:
+            os.unlink(claim)
+        except FileNotFoundError:
+            pass
+
     def delete(self, path):
-        """项目内部接口说明。"""
+        """Delete content and its checkpoints as one recoverable operation.
+
+        Ordering:
+
+        1. Checkpoints are *staged* (moved to a private, manifest-backed
+           area) first, so they stop being visible before the content can
+           disappear -- never the other way round.
+        2. The content is then removed (trash or permanent delete).
+        3. Only once the content is actually gone are the staged
+           checkpoints purged and the ``delete`` event emitted.
+
+        Any failure after staging rolls the checkpoints back, leaving
+        content and checkpoints as they were.  A failure after the content
+        is gone leaves an on-disk transaction record, so a retry detects
+        it, finishes the cleanup, and reports success.  A duplicate request
+        that raced an in-flight delete is answered idempotently.  The
+        ``delete`` event therefore describes a delete that truly completed.
+        """
         path = path.strip("/")
         if not path:
             raise HTTPError(400, "Can't delete root")
-        self.delete_file(path)
-        self.checkpoints.delete_all_checkpoints(path)
+
+        lock = self._path_delete_lock(path)
+        duplicate = self._delete_was_active(path)
+        with lock:
+            self._mark_delete_active(path, True)
+            try:
+                with self._path_delete_claim(path) as claim_contended:
+                    self._delete_unlocked(path, duplicate=duplicate or claim_contended)
+            finally:
+                self._mark_delete_active(path, False)
+
+    def _resume_interrupted_delete(self, path, pending):
+        """Finish a delete whose content is already gone.
+
+        Returns ``None`` when there was no trace of an interrupted delete,
+        ``True`` when the state was fully cleaned and ``False`` when cleanup
+        is still incomplete (retryable).
+        """
+        did_work = False
+        ok = True
+        for txn_id, _entries in pending:
+            did_work = True
+            if not self.checkpoints.resume_checkpoint_deletes(path, txn_id):
+                ok = False
+        # Sweep stale checkpoint files not covered by a recorded transaction.
+        for _token, checkpoint_path in self.checkpoints.list_checkpoint_files(path):
+            if not os.path.lexists(checkpoint_path):
+                continue
+            did_work = True
+            try:
+                self.checkpoints.purge_checkpoint_file(checkpoint_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                self.log.error(
+                    "Failed to purge stale checkpoint %s while resuming delete of %r",
+                    checkpoint_path,
+                    path,
+                    exc_info=True,
+                )
+                ok = False
+        if not did_work:
+            return None
+        return ok
+
+    def _delete_unlocked(self, path, duplicate=False):
+        content_exists = self.exists(path)
+        if not content_exists and duplicate:
+            # Lost the race to a completed delete: report success once.
+            return
+
+        if not getattr(self.checkpoints, "supports_delete_transactions", False):
+            # Legacy checkpoint stores: keep the historical best-effort
+            # ordering without the staging/recovery protocol.
+            if not content_exists:
+                raise HTTPError(404, "file or directory does not exist: %r" % path)
+            self.delete_file(path)
+            self.checkpoints.delete_all_checkpoints(path)
+            self.emit(data={"action": "delete", "path": path})
+            return
+
+        pending = self.checkpoints.find_delete_transactions(path)
+
+        if not content_exists:
+            resumed = self._resume_interrupted_delete(path, pending)
+            if resumed is None:
+                if duplicate:
+                    # Lost the race to a fully completed delete: report the
+                    # same success but do not record a second event.
+                    return
+                raise HTTPError(404, "file or directory does not exist: %r" % path)
+            if not resumed:
+                raise HTTPError(
+                    500,
+                    "Delete of %r was interrupted and could not be fully completed; "
+                    "the content is gone but some checkpoints remain. Retry the request."
+                    % path,
+                )
+            # The interrupted delete is only now truly finished (by this
+            # request), so it is correct to emit the event here.
+            self.emit(data={"action": "delete", "path": path})
+            return
+
+        # Content present: adopt orphaned transactions from earlier attempts
+        # and restore their checkpoints before running a fresh delete.
+        adopted_pending = []
+        for txn_id, entries in pending:
+            failed = self.checkpoints.rollback_checkpoint_deletes(txn_id, entries)
+            adopted_pending.append(txn_id)
+            if failed:
+                self.log.error(
+                    "Interrupted delete transaction %s for %r left %d checkpoint(s) "
+                    "in the staging area; proceeding with a new delete",
+                    txn_id,
+                    path,
+                    len(failed),
+                )
+
+        # 1. Hide the checkpoints in the recoverable staging area.
+        txn_id, entries = self.checkpoints.stage_checkpoint_deletes(path)
+
+        # 2. Remove the content itself.
+        content_gone = False
+        content_error = None
+        try:
+            self.delete_file(path)
+        except Exception as exc:
+            content_error = exc
+        content_gone = not self.exists(path)
+
+        if not content_gone:
+            # Content survived (the failure happened before removal): undo
+            # the checkpoint staging so both facts are back to normal.
+            failed = self.checkpoints.rollback_checkpoint_deletes(txn_id, entries)
+            if failed:
+                # Compensation failed too: keep the transaction record so a
+                # retry can finish the recovery.
+                self.log.critical(
+                    "Delete of %r failed and %d staged checkpoint(s) could not be "
+                    "restored; retry the delete to recover",
+                    path,
+                    len(failed),
+                    exc_info=content_error,
+                )
+            if content_error is not None:
+                raise content_error
+            raise OSError("content %r still exists after delete" % path)
+
+        if content_error is not None:
+            # The content really disappeared, but delete_file then raised
+            # (the exact "file gone, storage then errored" case).  Do NOT
+            # restore the checkpoints -- that would expose the old
+            # checkpoint while the content is gone.  Keep the transaction
+            # staged and surface the error; a retry resumes the cleanup and
+            # reports a single, truthful completion.
+            self.log.error(
+                "Content %r was removed but delete reported an error %r; "
+                "checkpoints stay staged until a retry finishes the delete",
+                path,
+                content_error,
+            )
+            raise content_error
+
+        # 3. Permanently drop the staged checkpoints now that the content is
+        #    really gone.  A failure here is retryable via the transaction
+        #    record, so it must not look like a completed delete.
+        try:
+            self.checkpoints.commit_checkpoint_deletes(txn_id, entries)
+            # Earlier attempts whose rollback could not fully restore their
+            # checkpoints are now safe to purge for good.
+            for adopted_txn_id in adopted_pending:
+                if adopted_txn_id == txn_id:
+                    continue
+                self.checkpoints.resume_checkpoint_deletes(path, adopted_txn_id)
+        except Exception as e:
+            self.log.error(
+                "Content %r was deleted but checkpoint cleanup failed; "
+                "a retry will finish the operation",
+                path,
+                exc_info=True,
+            )
+            raise HTTPError(
+                500,
+                "Content %r was deleted but checkpoint cleanup failed: %s. "
+                "Retry the request to complete the delete." % (path, e),
+            ) from e
+
         self.emit(data={"action": "delete", "path": path})
 
     def rename(self, old_path, new_path):
         """项目内部接口说明。"""
-        self.rename_file(old_path, new_path)
-        self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        if old_path == new_path:
+            return
+        # Move checkpoints first; if the content move fails, move them back
+        # so the old path keeps both its content and its checkpoints.
+        moved_checkpoints = []
+        for cp in self.checkpoints.list_checkpoints(old_path):
+            self.checkpoints.rename_checkpoint(cp["id"], old_path, new_path)
+            moved_checkpoints.append(cp)
+        try:
+            self.rename_file(old_path, new_path)
+        except Exception:
+            for cp in reversed(moved_checkpoints):
+                try:
+                    self.checkpoints.rename_checkpoint(cp["id"], new_path, old_path)
+                except Exception:
+                    self.log.error(
+                        "Failed to move checkpoint %s back to %r",
+                        cp["id"],
+                        old_path,
+                        exc_info=True,
+                    )
+            raise
         self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
 
     def update(self, model, path):
@@ -677,20 +1001,216 @@ class AsyncContentsManager(ContentsManager):
         """项目内部接口说明。"""
         return None
 
+    # ------------------------------------------------------------------
+    # Delete serialization / recovery state (async counterpart)
+    # ------------------------------------------------------------------
+
+    def _async_delete_state(self):
+        state = getattr(self, "_async_delete_bookkeeping", None)
+        if state is None:
+            state = {"locks": {}, "in_flight": set()}
+            self._async_delete_bookkeeping = state
+        return state
+
+    async def _path_async_delete_lock(self, path):
+        state = self._async_delete_state()
+        lock = state["locks"].get(path)
+        if lock is None:
+            lock = asyncio.Lock()
+            state["locks"][path] = lock
+        return lock
+
+    def _async_delete_was_active(self, path):
+        state = self._async_delete_state()
+        return path in state["in_flight"]
+
+    def _mark_async_delete_active(self, path, active):
+        state = self._async_delete_state()
+        if active:
+            state["in_flight"].add(path)
+        else:
+            state["in_flight"].discard(path)
+
     async def delete(self, path):
-        """项目内部接口说明。"""
+        """Async counterpart of :meth:`ContentsManager.delete`.
+
+        Same recoverable ordering -- stage checkpoints, remove content,
+        purge checkpoints -- and the same idempotent behavior for duplicate
+        requests that race an in-flight delete.
+        """
         path = path.strip("/")
         if not path:
             raise HTTPError(400, "Can't delete root")
 
-        await self.delete_file(path)
-        await self.checkpoints.delete_all_checkpoints(path)
+        from anyio.to_thread import run_sync as _run_sync
+
+        lock = await self._path_async_delete_lock(path)
+        duplicate = self._async_delete_was_active(path)
+        async with lock:
+            self._mark_async_delete_active(path, True)
+            try:
+                claim, contended = await _run_sync(self._acquire_delete_claim, path)
+                try:
+                    await self._adelete_unlocked(
+                        path, duplicate=duplicate or contended
+                    )
+                finally:
+                    await _run_sync(self._release_delete_claim, claim)
+            finally:
+                self._mark_async_delete_active(path, False)
+
+    async def _resume_interrupted_delete_async(self, path, pending):
+        did_work = False
+        ok = True
+        for txn_id, _entries in pending:
+            did_work = True
+            if not await self.checkpoints.resume_checkpoint_deletes(path, txn_id):
+                ok = False
+        for _token, checkpoint_path in await self.checkpoints.list_checkpoint_files(path):
+            if not os.path.lexists(checkpoint_path):
+                continue
+            did_work = True
+            try:
+                await self.checkpoints.purge_checkpoint_file(checkpoint_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                self.log.error(
+                    "Failed to purge stale checkpoint %s while resuming delete of %r",
+                    checkpoint_path,
+                    path,
+                    exc_info=True,
+                )
+                ok = False
+        if not did_work:
+            return None
+        return ok
+
+    async def _adelete_unlocked(self, path, duplicate=False):
+        content_exists = await ensure_async(self.exists(path))
+        if not content_exists and duplicate:
+            return
+
+        if not getattr(self.checkpoints, "supports_delete_transactions", False):
+            if not content_exists:
+                raise HTTPError(404, "file or directory does not exist: %r" % path)
+            await self.delete_file(path)
+            await self.checkpoints.delete_all_checkpoints(path)
+            self.emit(data={"action": "delete", "path": path})
+            return
+
+        pending = await self.checkpoints.find_delete_transactions(path)
+
+        if not content_exists:
+            resumed = await self._resume_interrupted_delete_async(path, pending)
+            if resumed is None:
+                if duplicate:
+                    return
+                raise HTTPError(404, "file or directory does not exist: %r" % path)
+            if not resumed:
+                raise HTTPError(
+                    500,
+                    "Delete of %r was interrupted and could not be fully completed; "
+                    "the content is gone but some checkpoints remain. Retry the request."
+                    % path,
+                )
+            self.emit(data={"action": "delete", "path": path})
+            return
+
+        adopted_pending = []
+        for txn_id, entries in pending:
+            failed = await self.checkpoints.rollback_checkpoint_deletes(txn_id, entries)
+            adopted_pending.append(txn_id)
+            if failed:
+                self.log.error(
+                    "Interrupted delete transaction %s for %r left %d checkpoint(s) "
+                    "in the staging area; proceeding with a new delete",
+                    txn_id,
+                    path,
+                    len(failed),
+                )
+
+        txn_id, entries = await self.checkpoints.stage_checkpoint_deletes(path)
+
+        # 2. Remove the content itself.
+        content_error = None
+        try:
+            await self.delete_file(path)
+        except Exception as exc:
+            content_error = exc
+        content_gone = not await ensure_async(self.exists(path))
+
+        if not content_gone:
+            # Content survived: undo checkpoint staging so both facts match.
+            failed = await self.checkpoints.rollback_checkpoint_deletes(txn_id, entries)
+            if failed:
+                self.log.critical(
+                    "Delete of %r failed and %d staged checkpoint(s) could not be "
+                    "restored; retry the delete to recover",
+                    path,
+                    len(failed),
+                    exc_info=content_error,
+                )
+            if content_error is not None:
+                raise content_error
+            raise OSError("content %r still exists after delete" % path)
+
+        if content_error is not None:
+            # Content vanished but delete_file raised: keep checkpoints
+            # staged and surface the error; a retry resumes the cleanup.
+            self.log.error(
+                "Content %r was removed but delete reported an error %r; "
+                "checkpoints stay staged until a retry finishes the delete",
+                path,
+                content_error,
+            )
+            raise content_error
+
+        try:
+            await self.checkpoints.commit_checkpoint_deletes(txn_id, entries)
+            for adopted_txn_id in adopted_pending:
+                if adopted_txn_id == txn_id:
+                    continue
+                await self.checkpoints.resume_checkpoint_deletes(path, adopted_txn_id)
+        except Exception as e:
+            self.log.error(
+                "Content %r was deleted but checkpoint cleanup failed; "
+                "a retry will finish the operation",
+                path,
+                exc_info=True,
+            )
+            raise HTTPError(
+                500,
+                "Content %r was deleted but checkpoint cleanup failed: %s. "
+                "Retry the request to complete the delete." % (path, e),
+            ) from e
+
         self.emit(data={"action": "delete", "path": path})
 
     async def rename(self, old_path, new_path):
         """项目内部接口说明。"""
-        await self.rename_file(old_path, new_path)
-        await self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        if old_path == new_path:
+            return
+        moved_checkpoints = []
+        for cp in await self.checkpoints.list_checkpoints(old_path):
+            await self.checkpoints.rename_checkpoint(cp["id"], old_path, new_path)
+            moved_checkpoints.append(cp)
+        try:
+            await self.rename_file(old_path, new_path)
+        except Exception:
+            for cp in reversed(moved_checkpoints):
+                try:
+                    await self.checkpoints.rename_checkpoint(cp["id"], new_path, old_path)
+                except Exception:
+                    self.log.error(
+                        "Failed to move checkpoint %s back to %r",
+                        cp["id"],
+                        old_path,
+                        exc_info=True,
+                    )
+            raise
         self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
 
     async def update(self, model, path):
